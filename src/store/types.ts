@@ -6,9 +6,14 @@ export interface Timeline {
   duration: number
   playing: boolean
   selectedClipId: string | null
+  selectedTextLayerId: string | null
+  selectedTrackId: string | null
   clips: Clip[]
   tracks: Track[]
+  textLayers: TextLayer[]
   stateVersion: number
+  /** Main video source for playback (clips are segments of this) */
+  videoSrc?: string
 }
 
 export interface Clip {
@@ -24,6 +29,12 @@ export interface Clip {
   effects: string[]
   viralityScore: number | null
   color: string
+  /** Optional per-clip video override; else uses timeline.videoSrc */
+  videoSrc?: string
+  /** Start time in source video (seconds) — which portion of the source this clip plays */
+  sourceStart?: number
+  /** End time in source video (seconds) — sourceStart + raw length before trim */
+  sourceEnd?: number
 }
 
 export interface Caption {
@@ -41,6 +52,16 @@ export interface Transition {
   edge: 'in' | 'out'
 }
 
+/** Programmatic SFX type (for tracks with type 'sfx' and no src) */
+export type SfxType = 'whoosh' | 'ding' | 'tick' | 'chirp' | 'poof' | 'snip' | 'thunk'
+
+export interface SfxSegment {
+  id: string
+  startTime: number
+  duration: number
+  sfxType: SfxType
+}
+
 export interface Track {
   id: string
   type: 'music' | 'sfx' | 'voiceover'
@@ -49,6 +70,19 @@ export interface Track {
   duration: number
   volume: number
   muted: boolean
+  /** Audio source URL for this track (music/voiceover) */
+  src?: string
+  /** SFX segments on one layer (sfx tracks only); when present, startTime/duration are ignored for display */
+  segments?: SfxSegment[]
+}
+
+export interface TextLayer {
+  id: string
+  text: string
+  startTime: number
+  endTime: number
+  style: 'bold' | 'glow' | 'outline'
+  position: 'bottom' | 'center' | 'top'
 }
 
 // ─── Operations ─────────────────────────────────────────────
@@ -71,11 +105,17 @@ export type Op =
   | { type: 'track_volume'; trackId: string; volume: number }
   | { type: 'track_mute'; trackId: string; muted: boolean }
   | { type: 'track_move'; trackId: string; startTime: number }
+  | { type: 'text_layer_add'; text: string; startTime?: number; endTime?: number; style?: TextLayer['style']; position?: TextLayer['position'] }
+  | { type: 'text_layer_edit'; textLayerId: string; updates: Partial<Omit<TextLayer, 'id'>> }
+  | { type: 'text_layer_remove'; textLayerId: string }
+  | { type: 'text_layer_move'; textLayerId: string; startTime: number; endTime?: number }
   | { type: 'transition_add'; clipId: string; edge: 'in' | 'out'; transitionType: Transition['type']; duration?: number }
   | { type: 'transition_remove'; clipId: string; edge: 'in' | 'out' }
   | { type: 'undo' }
   | { type: 'redo' }
   | { type: 'select'; clipId: string | null }
+  | { type: 'select_track'; trackId: string | null }
+  | { type: 'select_text_layer'; textLayerId: string | null }
   | { type: 'seek'; time: number }
   | { type: 'play' }
   | { type: 'pause' }
@@ -134,6 +174,8 @@ export interface CommandLogEntry {
 
 export interface ConvoContext {
   lastReferencedClipId: string | null
+  lastReferencedTextLayerId: string | null
+  lastReferencedTrackId: string | null
   lastOperation: Op | null
   lastMentionedTime: number | null
   recentClipIds: string[]

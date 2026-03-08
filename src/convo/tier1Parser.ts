@@ -1,5 +1,5 @@
 import type { Op, Timeline, ConvoContext } from '../store/types'
-import { resolveClipReference, resolveTrackReference } from './clipResolver'
+import { resolveClipReference, resolveTrackReference, resolveTextLayerReference } from './clipResolver'
 
 export interface ParseResult {
   ops: Op[]
@@ -55,6 +55,20 @@ export function tier1Parse(
   }
   if (/^(pause|stop|hold)$/i.test(lower)) {
     return { ops: [{ type: 'pause' }], confidence: 0.98, explanation: 'Pause', escalate: false }
+  }
+
+  // Remove text layer — check BEFORE clip delete so "remove the subscribe text" targets text
+  if (/\b(remove|delete)\b/.test(lower)) {
+    const textResolved = resolveTextLayerReference(lower, timeline, context)
+    const hasTextHint = /\b(text|overlay|layer)\b/.test(lower) || timeline.selectedTextLayerId != null
+    if (textResolved.length > 0 && (hasTextHint || textResolved[0].confidence >= 0.85)) {
+      return {
+        ops: [{ type: 'text_layer_remove', textLayerId: textResolved[0].textLayer.id }],
+        confidence: textResolved[0].confidence,
+        explanation: `Remove text '${textResolved[0].textLayer.text}'`,
+        escalate: false,
+      }
+    }
   }
 
   // Delete
@@ -224,16 +238,24 @@ export function tier1Parse(
     }
   }
 
-  // Select / go to
+  // Select / go to — clips, text layers, or tracks
   if (/\b(select|go to|show me|focus)\b/.test(lower)) {
-    const resolved = resolveClipReference(lower.replace(/\b(select|go to|show me|focus)\b/, ''), timeline, context)
-    if (resolved.length > 0) {
-      return {
-        ops: [{ type: 'select', clipId: resolved[0].clip.id }],
-        confidence: resolved[0].confidence,
-        explanation: `Select '${resolved[0].clip.label}'`,
-        escalate: false,
-      }
+    const remainder = lower.replace(/\b(select|go to|show me|focus)\b/g, '').trim()
+    const rest = remainder || lower
+
+    // Try all three; use highest-confidence match
+    const clipResolved = resolveClipReference(rest, timeline, context)
+    const textResolved = resolveTextLayerReference(rest, timeline, context)
+    const track = resolveTrackReference(rest, timeline)
+
+    const candidates: { op: Op; conf: number; label: string }[] = []
+    if (clipResolved.length > 0) candidates.push({ op: { type: 'select', clipId: clipResolved[0].clip.id }, conf: clipResolved[0].confidence, label: clipResolved[0].clip.label })
+    if (textResolved.length > 0) candidates.push({ op: { type: 'select_text_layer', textLayerId: textResolved[0].textLayer.id }, conf: textResolved[0].confidence, label: textResolved[0].textLayer.text })
+    if (track) candidates.push({ op: { type: 'select_track', trackId: track.id }, conf: 0.9, label: track.label })
+
+    const best = candidates.sort((a, b) => b.conf - a.conf)[0]
+    if (best) {
+      return { ops: [best.op], confidence: best.conf, explanation: `Select '${best.label}'`, escalate: false }
     }
   }
 
@@ -319,6 +341,39 @@ export function tier1Parse(
     }
   }
 
+  // Add timeline text layer (overlay)
+  if (/\b(add|put|place)\b.*\b(text\s*layer|text\s*overlay|lower\s*third|title)\b/i.test(lower) || /\badd\s+text\b/.test(lower)) {
+    const textMatch = lower.match(/(?:says?|that says?|reading)\s+['""]?(.+?)['""]?\s*$/) ?? lower.match(/['""](.+?)['""]/) ?? lower.match(/add\s+text\s+['""]?(.+?)['""]?\s*(?:at|from)?/)
+    const text = textMatch?.[1]?.trim() ?? 'New text'
+    const atMatch = lower.match(/(?:at|from)\s+(\d+(?:\.\d+)?)\s*(?:sec|s|seconds?)?/)
+    const startTime = atMatch ? parseFloat(atMatch[1]) : 0
+    const durationMatch = lower.match(/(?:for|to)\s+(\d+(?:\.\d+)?)\s*(?:sec|s|seconds?)?/)
+    const endTime = durationMatch ? startTime + parseFloat(durationMatch[1]) : undefined
+    return {
+      ops: [{ type: 'text_layer_add', text, startTime, endTime }],
+      confidence: 0.85,
+      explanation: `Add text layer '${text}'`,
+      escalate: false,
+    }
+  }
+
+  // Edit text layer — "change X to Y", "edit the product market fit to subscribe"
+  if (/\b(change|edit|update|fix)\b.+\bto\b/.test(lower)) {
+    const toMatch = lower.match(/\bto\s+['""]?(.+?)['""]?\s*$/) ?? lower.match(/\bto\s+(.+)/)
+    const newText = toMatch?.[1]?.trim()
+    // Resolve target from text before "to" so "subscribe" doesn't match "Subscribe for more"
+    const beforeTo = lower.replace(/\bto\s+.*$/, '').trim()
+    const resolved = resolveTextLayerReference(beforeTo || lower, timeline, context)
+    if (resolved.length > 0 && newText && newText.length > 0) {
+      return {
+        ops: [{ type: 'text_layer_edit', textLayerId: resolved[0].textLayer.id, updates: { text: newText } }],
+        confidence: resolved[0].confidence,
+        explanation: `Change text to '${newText}'`,
+        escalate: false,
+      }
+    }
+  }
+
   // Add caption
   if (/\b(add|put|write)\b.*\b(caption|text|subtitle|overlay)\b/.test(lower) || /\bcaption\b/.test(lower)) {
     const textMatch = lower.match(/(?:says?|that says?|reading)\s+['""]?(.+?)['""]?\s*$/) ?? lower.match(/['""](.+?)['""]/)
@@ -354,13 +409,30 @@ export function tier1Parse(
     }
   }
 
-  // Seek
-  const seekMatch = lower.match(/\bgo to\s+(\d+(?:\.\d+)?)\s*(?:seconds?|s)?\b/)
-  if (seekMatch) {
+  // Seek — parse time from various formats
+  function parseSeekTime(text: string): number | null {
+    const lower = text.toLowerCase().trim()
+    // "0:15" or "1:30" (minutes:seconds)
+    const mmssMatch = lower.match(/\b(\d+):(\d{1,2})\b/)
+    if (mmssMatch) {
+      const mins = parseInt(mmssMatch[1], 10)
+      const secs = parseInt(mmssMatch[2], 10)
+      return mins * 60 + secs
+    }
+    // "30 seconds", "30s", "go to 30", "point 30", "seek to 30"
+    const secMatch = lower.match(/(?:go\s+to|seek\s+to|point|at)\s*(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)?\b/) ??
+      lower.match(/\b(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b/) ??
+      lower.match(/\b(?:go\s+to|seek)\s+(\d+(?:\.\d+)?)\b/)
+    if (secMatch) return parseFloat(secMatch[1])
+    return null
+  }
+
+  const seekTime = parseSeekTime(lower)
+  if (seekTime != null && seekTime >= 0) {
     return {
-      ops: [{ type: 'seek', time: parseFloat(seekMatch[1]) }],
+      ops: [{ type: 'seek', time: seekTime }],
       confidence: 0.92,
-      explanation: `Seek to ${seekMatch[1]}s`,
+      explanation: `Seek to ${seekTime.toFixed(1)}s`,
       escalate: false,
     }
   }

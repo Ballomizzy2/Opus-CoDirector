@@ -30,6 +30,7 @@ export default function InputArea({ onCommand }: Props) {
   const [interim, setInterim] = useState('')
   const [voiceSupported, setVoiceSupported] = useState(true)
   const recognitionRef = useRef<any>(null)
+  const userWantsListeningRef = useRef(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const [cmdHistory, setCmdHistory] = useState<string[]>([])
   const [histIdx, setHistIdx] = useState(-1)
@@ -67,8 +68,21 @@ export default function InputArea({ onCommand }: Props) {
         setInterim('')
       }
     }
-    rec.onerror = () => { setListening(false) }
-    rec.onend = () => { setListening(false) }
+    rec.onerror = (e: any) => {
+      const err = e?.error || e
+      if (err === 'not-allowed' || err === 'service-not-allowed') {
+        userWantsListeningRef.current = false
+        setListening(false)
+      }
+      // no-speech, aborted: browser stopped; onend will handle restart
+    }
+    rec.onend = () => {
+      if (userWantsListeningRef.current) {
+        try { rec.start() } catch { /* already starting */ }
+      } else {
+        setListening(false)
+      }
+    }
     recognitionRef.current = rec
   }, [onCommand])
 
@@ -76,10 +90,13 @@ export default function InputArea({ onCommand }: Props) {
     const rec = recognitionRef.current
     if (!rec) return
     if (listening) {
+      userWantsListeningRef.current = false
       rec.stop()
       setListening(false)
     } else {
-      try { rec.start(); setListening(true) } catch { /* already started */ }
+      userWantsListeningRef.current = true
+      setListening(true)
+      try { rec.start() } catch { /* already started */ }
     }
   }, [listening])
 

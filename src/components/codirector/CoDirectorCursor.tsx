@@ -34,14 +34,66 @@ function opToShape(opType: string): CursorShape {
     case 'move': case 'move_relative': return 'grab'
     case 'duplicate': return 'pointer'
     case 'caption_add': case 'caption_edit': return 'text'
+    case 'text_layer_add': case 'text_layer_edit': case 'text_layer_remove': case 'text_layer_move': return 'text'
     case 'effect_add': case 'transition_add': return 'wand'
     case 'effect_remove': case 'transition_remove': return 'wand'
-    case 'track_volume': return 'volume'
-    case 'track_mute': return 'volume'
-    case 'select': return 'pointer'
+    case 'track_volume': case 'track_mute': return 'volume'
+    case 'select': case 'select_text_layer': case 'select_track': return 'pointer'
     case 'seek': return 'seek'
     default: return 'pointer'
   }
+}
+
+/** Find target element for the cursor; prefer larger hit areas */
+function findTargetElement(op: Op): Element | undefined {
+  const opAny = op as Record<string, unknown>
+
+  if (opAny.clipIds && Array.isArray(opAny.clipIds) && (opAny.clipIds as string[]).length > 0) {
+    const clipId = (opAny.clipIds as string[])[0]
+    let el: Element | undefined
+    document.querySelectorAll('[data-clip-id]').forEach(e => {
+      if (e.getAttribute('data-clip-id') === clipId) el = e
+    })
+    return el
+  }
+  if (opAny.clipId) {
+    const clipId = opAny.clipId as string
+    let el: Element | undefined
+    document.querySelectorAll('[data-clip-id]').forEach(e => {
+      if (e.getAttribute('data-clip-id') === clipId) el = e
+    })
+    return el
+  }
+  if (opAny.trackId) {
+    const trackId = opAny.trackId as string
+    const row = document.querySelector(`[data-track-row][data-track-id="${trackId}"]`)
+    if (row) return row
+    let el: Element | undefined
+    document.querySelectorAll('[data-track-id]').forEach(e => {
+      if (e.getAttribute('data-track-id') === trackId) el = e
+    })
+    return el
+  }
+  if (opAny.textLayerId) {
+    const textLayerId = opAny.textLayerId as string
+    let el: Element | undefined
+    document.querySelectorAll('[data-text-layer-id]').forEach(e => {
+      if (e.getAttribute('data-text-layer-id') === textLayerId) el = e
+    })
+    return el
+  }
+  return undefined
+}
+
+function clampToViewport(x: number, y: number, padding = 60): { x: number; y: number } {
+  return {
+    x: Math.max(padding, Math.min(window.innerWidth - padding, x)),
+    y: Math.max(padding, Math.min(window.innerHeight - padding, y)),
+  }
+}
+
+function easeInOutCubic(t: number): number {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
 }
 
 interface Props {
@@ -59,140 +111,125 @@ export default function CoDirectorCursor({ pendingOp, onAnimationComplete }: Pro
   const animate = useCallback((op: Op) => {
     const shape = opToShape(op.type)
 
-    // Find the target element on the timeline
-    let targetEl: Element | undefined
-    const opAny = op as Record<string, unknown>
-    if (opAny.clipId) {
-      const clipId = opAny.clipId as string
-      document.querySelectorAll('[data-clip-id]').forEach(el => {
-        if (el.getAttribute('data-clip-id') === clipId) targetEl = el
-      })
-    }
-    if (opAny.trackId) {
-      const trackId = opAny.trackId as string
-      document.querySelectorAll('[data-track-id]').forEach(el => {
-        if (el.getAttribute('data-track-id') === trackId) targetEl = el
-      })
-    }
-
-    const rect = targetEl?.getBoundingClientRect() ?? {
-      left: window.innerWidth / 2 - 50,
-      top: window.innerHeight * 0.45,
-      width: 100,
-      height: 60,
-    }
-
-    const targetX = rect.left + rect.width / 2
-    const targetY = rect.top + rect.height / 2
-
-    // Start position: off-screen right
-    const startX = window.innerWidth + 20
-    const startY = targetY - 30
-
-    const startTime = performance.now()
-    const travelDuration = 400
-    const holdDuration = 200
-    const actionDuration = 300
-    const fadeDuration = 300
-
-    const totalDuration = travelDuration + holdDuration + actionDuration + fadeDuration
-
-    // Show cursor at start
-    setCursor({
-      visible: true, x: startX, y: startY, shape: 'pointer', trail: [], label: '',
-    })
-
-    function tick(now: number) {
-      const elapsed = now - startTime
-      const trail = trailRef.current
-
-      if (elapsed < travelDuration) {
-        // Phase 1: Travel to target
-        const t = easeOutCubic(elapsed / travelDuration)
-        const x = startX + (targetX - startX) * t
-        const y = startY + (targetY - startY) * t
-
-        // Update trail
-        trail.unshift({ x, y, opacity: 0.4 })
-        if (trail.length > 4) trail.pop()
-        trail.forEach((p, i) => { p.opacity = 0.4 - i * 0.1 })
-        trailRef.current = trail
-
-        setCursor({ visible: true, x, y, shape: 'pointer', trail: [...trail], label: '' })
-      } else if (elapsed < travelDuration + holdDuration) {
-        // Phase 2: Hold + morph to action shape
-        const morphT = (elapsed - travelDuration) / holdDuration
-        setCursor(prev => ({
-          ...prev, x: targetX, y: targetY,
-          shape: morphT > 0.5 ? shape : 'pointer',
-          trail: trail.map(p => ({ ...p, opacity: p.opacity * 0.9 })),
-        }))
-      } else if (elapsed < travelDuration + holdDuration + actionDuration) {
-        // Phase 3: Action animation
-        const actionT = (elapsed - travelDuration - holdDuration) / actionDuration
-        let x = targetX
-        let y = targetY
-
-        // Shape-specific motion
-        if (shape === 'trim') {
-          x = targetX + actionT * 30 // drag rightward
-        } else if (shape === 'grab') {
-          x = targetX + Math.sin(actionT * Math.PI) * 40
-          y = targetY - actionT * 3
-        } else if (shape === 'delete') {
-          y = targetY + actionT * 4 // push down
-        } else if (shape === 'wand') {
-          // sparkle rotation
-        }
-
-        setCursor(prev => ({
-          ...prev, x, y, shape,
-          trail: trail.map(p => ({ ...p, opacity: p.opacity * 0.8 })),
-        }))
-      } else if (elapsed < totalDuration) {
-        // Phase 4: Fade out
-        const fadeT = (elapsed - travelDuration - holdDuration - actionDuration) / fadeDuration
-        setCursor(prev => ({
-          ...prev, visible: fadeT < 0.8, shape,
-          trail: [],
-        }))
-      } else {
-        // Done
-        setCursor(prev => ({ ...prev, visible: false, trail: [] }))
-        trailRef.current = []
-        onAnimationComplete?.()
-        return
+    // Delay so React has time to update the DOM after the command
+    const runAnimation = () => {
+      const el = findTargetElement(op)
+      const rect = el?.getBoundingClientRect() ?? {
+        left: window.innerWidth / 2 - 50,
+        top: window.innerHeight * 0.4,
+        width: 100,
+        height: 60,
       }
+
+      let targetX = rect.left + rect.width / 2
+      let targetY = rect.top + rect.height / 2
+      const clamped = clampToViewport(targetX, targetY)
+      targetX = clamped.x
+      targetY = clamped.y
+
+      const startX = window.innerWidth + 30
+      const startY = targetY
+
+      const startTime = performance.now()
+      const travelDuration = 350
+      const holdDuration = 180
+      const actionDuration = 280
+      const fadeDuration = 250
+      const totalDuration = travelDuration + holdDuration + actionDuration + fadeDuration
+
+      setCursor({ visible: true, x: startX, y: startY, shape: 'pointer', trail: [], label: '' })
+      trailRef.current = []
+
+      function tick(now: number) {
+          const elapsed = now - startTime
+          const trail = trailRef.current
+
+          if (elapsed < travelDuration) {
+            const t = easeInOutCubic(elapsed / travelDuration)
+            const x = startX + (targetX - startX) * t
+            const y = startY + (targetY - startY) * t
+
+            trail.unshift({ x, y, opacity: 0.5 })
+            if (trail.length > 6) trail.pop()
+            trail.forEach((p, i) => { p.opacity = Math.max(0, 0.5 - i * 0.08) })
+            trailRef.current = trail
+
+            setCursor({ visible: true, x, y, shape: 'pointer', trail: [...trail], label: '' })
+          } else if (elapsed < travelDuration + holdDuration) {
+            const morphT = (elapsed - travelDuration) / holdDuration
+            setCursor(prev => ({
+              ...prev, x: targetX, y: targetY,
+              shape: morphT > 0.4 ? shape : 'pointer',
+              trail: trail.map(p => ({ ...p, opacity: p.opacity * 0.85 })),
+            }))
+          } else if (elapsed < travelDuration + holdDuration + actionDuration) {
+            const actionT = (elapsed - travelDuration - holdDuration) / actionDuration
+            let x = targetX
+            let y = targetY
+
+            if (shape === 'trim') {
+              x = targetX + actionT * 25
+            } else if (shape === 'grab') {
+              x = targetX + Math.sin(actionT * Math.PI) * 35
+              y = targetY - actionT * 2
+            } else if (shape === 'delete') {
+              y = targetY + actionT * 6
+            } else if (shape === 'scissors') {
+              y = targetY - Math.sin(actionT * Math.PI) * 8
+            }
+
+            setCursor(prev => ({
+              ...prev, x, y, shape,
+              trail: trail.map(p => ({ ...p, opacity: p.opacity * 0.7 })),
+            }))
+          } else if (elapsed < totalDuration) {
+            const fadeT = (elapsed - travelDuration - holdDuration - actionDuration) / fadeDuration
+            setCursor(prev => ({
+              ...prev, visible: fadeT < 0.85, shape,
+              trail: [],
+            }))
+          } else {
+            setCursor(prev => ({ ...prev, visible: false, trail: [] }))
+            trailRef.current = []
+            onAnimationComplete?.()
+            return
+          }
+
+          animRef.current = requestAnimationFrame(tick)
+        }
 
       animRef.current = requestAnimationFrame(tick)
     }
 
-    animRef.current = requestAnimationFrame(tick)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(runAnimation)
+    })
   }, [onAnimationComplete])
 
   useEffect(() => {
     if (pendingOp) {
       const op = pendingOp.op
-      // Skip transient ops
-      if (op.type === 'play' || op.type === 'pause' || op.type === 'undo' || op.type === 'redo') {
+      if (op.type === 'play' || op.type === 'pause' || op.type === 'seek' || op.type === 'undo' || op.type === 'redo') {
         onAnimationComplete?.()
         return
       }
-      // For batches, animate for the first op
       const animOp = op.type === 'batch' ? (op.ops[0] ?? op) : op
-      animate(animOp)
+      if (animOp && animOp.type !== 'play' && animOp.type !== 'pause' && animOp.type !== 'seek') {
+        animate(animOp)
+      } else {
+        onAnimationComplete?.()
+      }
     }
 
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current)
     }
-  }, [pendingOp, animate])
+  }, [pendingOp, animate, onAnimationComplete])
 
   if (!cursor.visible) return null
 
   return (
     <div className="fixed inset-0 pointer-events-none z-[9999]">
-      {/* Trail */}
       {cursor.trail.map((p, i) => (
         <div
           key={i}
@@ -200,49 +237,44 @@ export default function CoDirectorCursor({ pendingOp, onAnimationComplete }: Pro
           style={{
             left: p.x - 10,
             top: p.y - 10,
-            background: `rgba(255, 255, 255, ${p.opacity * 0.3})`,
-            filter: 'blur(4px)',
-            transition: 'left 30ms, top 30ms',
+            background: `rgba(255, 255, 255, ${p.opacity * 0.35})`,
+            filter: 'blur(5px)',
           }}
         />
       ))}
 
-      {/* Main cursor */}
       <div
-        className="absolute flex items-center gap-1"
+        className="absolute flex items-center justify-center will-change-transform"
         style={{
           left: cursor.x,
           top: cursor.y,
-          transform: 'translate(-4px, -4px)',
-          transition: 'left 16ms linear, top 16ms linear',
+          transform: 'translate(-50%, -50%)',
         }}
       >
-        {/* Cursor icon */}
         <div className="relative">
-          <div className="w-6 h-6 flex items-center justify-center text-white text-sm
-                          drop-shadow-[0_0_8px_rgba(255,255,255,0.6)]"
-               style={{ filter: 'drop-shadow(0 0 4px rgba(255,255,255,0.4))' }}>
+          <div className="w-7 h-7 flex items-center justify-center text-white text-base
+                          drop-shadow-[0_0_10px_rgba(255,255,255,0.7)]"
+               style={{ filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.3))' }}>
             {SHAPE_ICONS[cursor.shape]}
           </div>
-          {/* "Co" badge */}
-          <div className="absolute -bottom-1 -right-1 w-3 h-3 rounded-full bg-white
-                          flex items-center justify-center text-[5px] font-bold text-neutral-900">
+          <div className="absolute -bottom-1 -right-1 w-3.5 h-3.5 rounded-full bg-white
+                          flex items-center justify-center text-[5px] font-bold text-neutral-900 shadow-sm">
             Co
           </div>
         </div>
 
-        {/* Sparkle particles for 'wand' shape */}
         {cursor.shape === 'wand' && (
-          <div className="absolute -inset-3">
+          <div className="absolute -inset-4 pointer-events-none">
             {[0, 1, 2, 3].map(i => (
               <div
                 key={i}
-                className="absolute w-1 h-1 bg-white rounded-full animate-ping"
+                className="absolute w-1.5 h-1.5 bg-white rounded-full animate-ping"
                 style={{
-                  left: `${30 + Math.cos(i * 1.57) * 20}%`,
-                  top: `${30 + Math.sin(i * 1.57) * 20}%`,
-                  animationDelay: `${i * 75}ms`,
-                  animationDuration: '600ms',
+                  left: `${50 + Math.cos(i * 1.57) * 25}%`,
+                  top: `${50 + Math.sin(i * 1.57) * 25}%`,
+                  transform: 'translate(-50%, -50%)',
+                  animationDelay: `${i * 80}ms`,
+                  animationDuration: '500ms',
                 }}
               />
             ))}
@@ -251,8 +283,4 @@ export default function CoDirectorCursor({ pendingOp, onAnimationComplete }: Pro
       </div>
     </div>
   )
-}
-
-function easeOutCubic(t: number): number {
-  return 1 - Math.pow(1 - t, 3)
 }

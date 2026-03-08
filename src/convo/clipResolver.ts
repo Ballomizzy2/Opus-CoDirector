@@ -1,4 +1,4 @@
-import type { Clip, Track, Timeline, ConvoContext } from '../store/types'
+import type { Clip, Track, Timeline, ConvoContext, TextLayer } from '../store/types'
 import { getClipStartTime } from '../store/editorReducer'
 
 export interface ResolvedClip {
@@ -126,7 +126,7 @@ export function resolveTrackReference(text: string, timeline: Timeline): Track |
   if (/\b(sfx|sound\s*effect|whoosh|effect)\b/.test(lower)) {
     return timeline.tracks.find(t => t.type === 'sfx') ?? null
   }
-  if (/\b(voiceover|vo|narration)\b/.test(lower)) {
+  if (/\b(voiceover|vo|narration|voice\s*over)\b/.test(lower)) {
     return timeline.tracks.find(t => t.type === 'voiceover') ?? null
   }
   for (const track of timeline.tracks) {
@@ -149,4 +149,47 @@ export function getClipAtPlayhead(timeline: Timeline): Clip | null {
 export function getClipsByLabel(query: string, clips: Clip[]): Clip[] {
   const lower = query.toLowerCase()
   return clips.filter(c => c.label.toLowerCase().includes(lower))
+}
+
+export interface ResolvedTextLayer {
+  textLayer: TextLayer
+  confidence: number
+}
+
+export function getTextLayerAtPlayhead(timeline: Timeline): TextLayer | null {
+  const { playhead, textLayers } = timeline
+  return textLayers.find(tl => playhead >= tl.startTime && playhead < tl.endTime) ?? null
+}
+
+export function resolveTextLayerReference(text: string, timeline: Timeline, context: ConvoContext): ResolvedTextLayer[] {
+  const lower = text.toLowerCase().trim()
+  const layers = timeline.textLayers
+  if (layers.length === 0) return []
+
+  // "it" / "this" / "the text" / "right here" → selected, last referenced, or at playhead
+  if (/\b(it|this|that|the text|the overlay|right here|this part)\b/.test(lower)) {
+    const atPlayhead = getTextLayerAtPlayhead(timeline)
+    const id = context.lastReferencedTextLayerId ?? timeline.selectedTextLayerId
+    const layer = atPlayhead ?? (id ? layers.find(tl => tl.id === id) : null) ?? layers[layers.length - 1]
+    if (layer) return [{ textLayer: layer, confidence: atPlayhead ? 0.95 : 0.9 }]
+  }
+
+  // "first" / "second" / "third" text
+  const ordinals: Record<string, number> = { first: 0, second: 1, third: 2, fourth: 3, fifth: 4 }
+  for (const [word, idx] of Object.entries(ordinals)) {
+    if (lower.includes(word) && idx < layers.length) {
+      return [{ textLayer: layers[idx], confidence: 0.9 }]
+    }
+  }
+
+  // Text content match
+  const words = lower.replace(/\b(the|a|an|text|overlay|layer)\b/g, '').trim().split(/\s+/).filter(Boolean)
+  if (words.length > 0) {
+    const matches = layers.filter(tl =>
+      words.some(w => tl.text.toLowerCase().includes(w))
+    )
+    if (matches.length > 0) return matches.map(tl => ({ textLayer: tl, confidence: 0.85 }))
+  }
+
+  return [{ textLayer: layers[0], confidence: 0.6 }]
 }

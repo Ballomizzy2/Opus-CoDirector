@@ -1,4 +1,4 @@
-import type { EditorState, Timeline, Clip, Op } from './types'
+import type { EditorState, Timeline, Clip, Op, TextLayer } from './types'
 import { createInitialTimeline } from './demoData'
 
 // ─── Helpers ────────────────────────────────────────────────
@@ -31,7 +31,11 @@ function deepCloneTimeline(t: Timeline): Timeline {
       transitions: c.transitions.map(tr => ({ ...tr })),
       effects: [...c.effects],
     })),
-    tracks: t.tracks.map(tr => ({ ...tr })),
+    tracks: t.tracks.map(tr => ({
+      ...tr,
+      segments: tr.segments?.map(s => ({ ...s })),
+    })),
+    textLayers: t.textLayers.map(tl => ({ ...tl })),
   }
 }
 
@@ -55,18 +59,25 @@ function applyCut(timeline: Timeline, clipId: string, at: number): Timeline | st
   }
 
   const rawCutPoint = clip.trimStart + relativeTime * clip.speed
+  const srcStart = clip.sourceStart ?? 0
+  const srcEnd = clip.sourceEnd ?? clip.duration
+  const absCutPoint = srcStart + rawCutPoint
 
   const clipA: Clip = {
     ...clip, id: uid(), label: clip.label + ' (A)',
-    trimEnd: clip.duration - rawCutPoint,
+    trimStart: 0, trimEnd: 0,
+    duration: rawCutPoint,
     effectiveDuration: 0, captions: [], transitions: [], effects: [...clip.effects],
+    sourceStart: srcStart, sourceEnd: absCutPoint,
   }
   clipA.effectiveDuration = calcEffective(clipA)
 
   const clipB: Clip = {
     ...clip, id: uid(), label: clip.label + ' (B)',
-    trimStart: rawCutPoint,
+    trimStart: 0, trimEnd: 0,
+    duration: (srcEnd - srcStart) - rawCutPoint,
     effectiveDuration: 0, captions: [], transitions: [], effects: [...clip.effects],
+    sourceStart: absCutPoint, sourceEnd: srcEnd,
   }
   clipB.effectiveDuration = calcEffective(clipB)
 
@@ -273,6 +284,38 @@ function applyTransitionRemove(timeline: Timeline, clipId: string, edge: 'in' | 
   return { ...timeline, clips: newClips }
 }
 
+function applyTextLayerAdd(timeline: Timeline, text: string, startTime = 0, endTime?: number, style: TextLayer['style'] = 'bold', position: TextLayer['position'] = 'bottom'): Timeline | string {
+  const dur = endTime ?? startTime + 5
+  if (dur <= startTime) return 'End time must be after start time'
+  const newLayer: TextLayer = { id: uid('tl'), text, startTime, endTime: dur, style, position }
+  return { ...timeline, textLayers: [...timeline.textLayers, newLayer] }
+}
+
+function applyTextLayerEdit(timeline: Timeline, textLayerId: string, updates: Partial<Omit<TextLayer, 'id'>>): Timeline | string {
+  const idx = timeline.textLayers.findIndex(tl => tl.id === textLayerId)
+  if (idx === -1) return 'Text layer not found'
+  const newLayers = [...timeline.textLayers]
+  newLayers[idx] = { ...newLayers[idx], ...updates }
+  return { ...timeline, textLayers: newLayers }
+}
+
+function applyTextLayerRemove(timeline: Timeline, textLayerId: string): Timeline | string {
+  const newLayers = timeline.textLayers.filter(tl => tl.id !== textLayerId)
+  const selected = timeline.selectedTextLayerId === textLayerId ? null : timeline.selectedTextLayerId
+  return { ...timeline, textLayers: newLayers, selectedTextLayerId: selected }
+}
+
+function applyTextLayerMove(timeline: Timeline, textLayerId: string, startTime: number, endTime?: number): Timeline | string {
+  const idx = timeline.textLayers.findIndex(tl => tl.id === textLayerId)
+  if (idx === -1) return 'Text layer not found'
+  const layer = timeline.textLayers[idx]
+  const newEnd = endTime ?? startTime + (layer.endTime - layer.startTime)
+  if (newEnd <= startTime) return 'End time must be after start time'
+  const newLayers = [...timeline.textLayers]
+  newLayers[idx] = { ...layer, startTime, endTime: newEnd }
+  return { ...timeline, textLayers: newLayers }
+}
+
 // ─── Single Op Applier ──────────────────────────────────────
 
 function applyOp(timeline: Timeline, op: Op): Timeline | string {
@@ -296,7 +339,13 @@ function applyOp(timeline: Timeline, op: Op): Timeline | string {
     case 'track_move': return applyTrackMove(timeline, op.trackId, op.startTime)
     case 'transition_add': return applyTransitionAdd(timeline, op.clipId, op.edge, op.transitionType, op.duration)
     case 'transition_remove': return applyTransitionRemove(timeline, op.clipId, op.edge)
-    case 'select': return { ...timeline, selectedClipId: op.clipId }
+    case 'text_layer_add': return applyTextLayerAdd(timeline, op.text, op.startTime, op.endTime, op.style, op.position)
+    case 'text_layer_edit': return applyTextLayerEdit(timeline, op.textLayerId, op.updates)
+    case 'text_layer_remove': return applyTextLayerRemove(timeline, op.textLayerId)
+    case 'text_layer_move': return applyTextLayerMove(timeline, op.textLayerId, op.startTime, op.endTime)
+    case 'select': return { ...timeline, selectedClipId: op.clipId, selectedTextLayerId: null, selectedTrackId: null }
+    case 'select_text_layer': return { ...timeline, selectedTextLayerId: op.textLayerId, selectedClipId: null, selectedTrackId: null }
+    case 'select_track': return { ...timeline, selectedTrackId: op.trackId, selectedClipId: null, selectedTextLayerId: null }
     case 'seek': return { ...timeline, playhead: Math.max(0, Math.min(op.time, timeline.duration)) }
     case 'play': return { ...timeline, playing: true }
     case 'pause': return { ...timeline, playing: false }
@@ -364,7 +413,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
   }
 
   // Non-undoable ops: play/pause/seek/select don't push to undo stack
-  const isTransient = op.type === 'play' || op.type === 'pause' || op.type === 'seek' || op.type === 'select'
+  const isTransient = op.type === 'play' || op.type === 'pause' || op.type === 'seek' || op.type === 'select' || op.type === 'select_text_layer' || op.type === 'select_track'
 
   const result = applyOp(state.timeline, op)
   if (typeof result === 'string') return state

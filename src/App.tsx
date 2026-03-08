@@ -1,18 +1,21 @@
 import { useReducer, useCallback, useRef, useEffect, useState } from 'react'
 import { editorReducer, createInitialState } from './store/editorReducer'
+import { useMediaPlayback } from './hooks/useMediaPlayback'
 import type { Op, CommandLogEntry, ConvoContext } from './store/types'
 import type { Toast } from './components/codirector/UndoToast'
 import { executeCommand, executeCommandAsync } from './convo/commandExecutor'
-import Timeline from './components/editor/Timeline'
-import AudioTracks from './components/editor/AudioTracks'
+import TimelineTracks from './components/editor/TimelineTracks'
 import Preview from './components/editor/Preview'
 import Inspector from './components/editor/Inspector'
+import TextLayerInspector from './components/editor/TextLayerInspector'
+import TrackInspector from './components/editor/TrackInspector'
 import Transport from './components/editor/Transport'
 import CommandLog from './components/codirector/CommandLog'
 import InputArea from './components/codirector/InputArea'
 import UndoToast from './components/codirector/UndoToast'
 import CoDirectorCursor from './components/codirector/CoDirectorCursor'
 import ProactiveSuggestion from './components/codirector/ProactiveSuggestion'
+import ResizeHandle from './components/ResizeHandle'
 import { Undo2, Redo2, Settings, Download, Key, X } from 'lucide-react'
 
 export default function App() {
@@ -24,7 +27,7 @@ export default function App() {
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem('codirector-api-key') ?? '')
   const [showSettings, setShowSettings] = useState(false)
   const [convoContext, setConvoContext] = useState<ConvoContext>({
-    lastReferencedClipId: null, lastOperation: null, lastMentionedTime: null,
+    lastReferencedClipId: null, lastReferencedTextLayerId: null, lastReferencedTrackId: null, lastOperation: null, lastMentionedTime: null,
     recentClipIds: [], lastActivityTimestamp: Date.now(),
   })
   const playInterval = useRef<number | null>(null)
@@ -33,6 +36,15 @@ export default function App() {
   const contextRef = useRef(convoContext)
   contextRef.current = convoContext
   const { timeline } = state
+
+  const { videoRef, musicRef, voiceoverRef } = useMediaPlayback(timeline)
+
+  // Resizable panel state
+  const [editorRatio, setEditorRatio] = useState(0.65)
+  const [previewWidth, setPreviewWidth] = useState(192)
+  const [inspectorRatio, setInspectorRatio] = useState(0.4)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const rightColRef = useRef<HTMLDivElement>(null)
 
   // Playback loop
   useEffect(() => {
@@ -85,13 +97,21 @@ export default function App() {
   const processResult = useCallback((result: { logEntry: CommandLogEntry; ops: Op[] }) => {
     setCommandLog(prev => [...prev, result.logEntry])
 
-    if (result.logEntry.affectedClipIds.length > 0) {
-      const lastClipId = result.logEntry.affectedClipIds[0]
+    const lastClipId = result.logEntry.affectedClipIds[0]
+    const lastTextLayerId = result.ops
+      .map(o => ('textLayerId' in o ? (o as { textLayerId: string }).textLayerId : null))
+      .find(id => id != null)
+    const lastTrackId = result.ops
+      .map(o => (o.type === 'select_track' && o.trackId ? o.trackId : ('trackId' in o ? (o as { trackId: string }).trackId : null)))
+      .find(id => id != null)
+    if (lastClipId || lastTextLayerId || lastTrackId) {
       setConvoContext(prev => ({
         ...prev,
-        lastReferencedClipId: lastClipId,
+        lastReferencedClipId: lastClipId ?? prev.lastReferencedClipId,
+        lastReferencedTextLayerId: lastTextLayerId ?? prev.lastReferencedTextLayerId,
+        lastReferencedTrackId: lastTrackId ?? prev.lastReferencedTrackId,
         lastOperation: result.ops[0] ?? null,
-        recentClipIds: [lastClipId, ...prev.recentClipIds.filter(id => id !== lastClipId)].slice(0, 5),
+        recentClipIds: lastClipId ? [lastClipId, ...prev.recentClipIds.filter(id => id !== lastClipId)].slice(0, 5) : prev.recentClipIds,
         lastActivityTimestamp: Date.now(),
       }))
     }
@@ -102,7 +122,7 @@ export default function App() {
     }
 
     const opType = result.ops[0]?.type
-    if (result.logEntry.status === 'applied' && opType && !['play', 'pause', 'seek', 'select', 'undo', 'redo'].includes(opType)) {
+    if (result.logEntry.status === 'applied' && opType && !['play', 'pause', 'seek', 'select', 'select_text_layer', 'select_track', 'undo', 'redo'].includes(opType)) {
       const isDestructive = opType === 'delete' || opType === 'delete_batch'
       setToasts(prev => [
         { id: result.logEntry.id, message: result.logEntry.explanation, destructive: isDestructive, timestamp: Date.now() },
@@ -148,6 +168,8 @@ export default function App() {
   }, [])
 
   const selectedClip = timeline.clips.find(c => c.id === timeline.selectedClipId) ?? null
+  const selectedTextLayer = timeline.textLayers.find(tl => tl.id === timeline.selectedTextLayerId) ?? null
+  const selectedTrack = timeline.tracks.find(t => t.id === timeline.selectedTrackId) ?? null
   const selectedClipStart = (() => {
     if (!selectedClip) return 0
     let t = 0
@@ -177,8 +199,18 @@ export default function App() {
     localStorage.setItem('codirector-api-key', key)
   }, [])
 
+  const musicTrack = timeline.tracks.find(t => t.type === 'music' && t.src)
+  const voiceoverTrack = timeline.tracks.find(t => t.type === 'voiceover' && t.src)
+
   return (
     <div className="h-screen flex flex-col bg-neutral-800 text-white overflow-hidden">
+      {/* Hidden audio for music and voiceover playback */}
+      {musicTrack?.src && (
+        <audio ref={musicRef} src={musicTrack.src} className="hidden" />
+      )}
+      {voiceoverTrack?.src && (
+        <audio ref={voiceoverRef} src={voiceoverTrack.src} className="hidden" />
+      )}
       {/* ─── Header ─── */}
       <header className="shrink-0 flex items-center justify-between px-4 py-2 border-b border-neutral-600/30 bg-neutral-800">
         <div className="flex items-center gap-3">
@@ -237,52 +269,95 @@ export default function App() {
         </div>
       )}
 
-      {/* ─── Editor Zone (~65%) ─── */}
-      <div className="flex-[65] min-h-0 flex border-b border-neutral-500/30">
-        {/* Left column: full-height Preview */}
-        <div className="w-48 shrink-0 p-3 border-r border-neutral-500/30 overflow-hidden flex flex-col">
-          <div className="flex-1 min-h-0">
-            <Preview clip={previewClip} playhead={timeline.playhead} playing={timeline.playing} />
+      {/* ─── Main content: Editor + CoDirector (resizable) ─── */}
+      <div ref={contentRef} className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        {/* Editor Zone */}
+        <div
+          className="min-h-0 flex border-b border-neutral-500/30 overflow-hidden"
+          style={{ flex: `0 0 ${editorRatio * 100}%` }}
+        >
+          {/* Left: Preview (resizable width) */}
+          <div
+            className="shrink-0 p-3 border-r border-neutral-500/30 overflow-hidden flex flex-col"
+            style={{ width: previewWidth }}
+          >
+            <div className="flex-1 min-h-0">
+              <Preview
+                clip={previewClip}
+                playhead={timeline.playhead}
+                playing={timeline.playing}
+                textLayers={timeline.textLayers}
+                videoRef={videoRef}
+                videoSrc={timeline.videoSrc}
+              />
+            </div>
           </div>
-        </div>
 
-        {/* Right column: Inspector on top, Timeline on bottom */}
-        <div className="flex-1 min-w-0 flex flex-col">
-          <div className="flex-[40] min-h-0 overflow-y-auto p-3">
-            {selectedClip ? (
-              <Inspector clip={selectedClip} clipStartTime={selectedClipStart} dispatch={dispatch} />
-            ) : (
-              <div className="h-full flex items-center justify-center text-xs text-neutral-400">
-                <p>Select a clip to inspect</p>
+          <ResizeHandle
+            direction="vertical"
+            onResize={delta => setPreviewWidth(w => Math.max(120, Math.min(400, w + delta)))}
+          />
+
+          {/* Right column: Inspector + Timeline (resizable) */}
+          <div ref={rightColRef} className="flex-1 min-w-0 flex flex-col overflow-hidden">
+            <div
+              className="min-h-0 overflow-y-auto p-3 shrink-0"
+              style={{ flex: `0 0 ${inspectorRatio * 100}%` }}
+            >
+              {selectedClip ? (
+                <Inspector clip={selectedClip} clipStartTime={selectedClipStart} dispatch={dispatch} />
+              ) : selectedTextLayer ? (
+                <TextLayerInspector textLayer={selectedTextLayer} dispatch={dispatch} />
+              ) : selectedTrack ? (
+                <TrackInspector track={selectedTrack} dispatch={dispatch} />
+              ) : (
+                <div className="h-full flex items-center justify-center text-xs text-neutral-400">
+                  <p>Select a clip, text layer, or track</p>
+                </div>
+              )}
+            </div>
+
+            <ResizeHandle
+              direction="horizontal"
+              onResize={delta => {
+                const h = rightColRef.current?.clientHeight ?? 400
+                setInspectorRatio(r => Math.max(0.15, Math.min(0.75, r + delta / h)))
+              }}
+            />
+
+            <div className="flex-1 min-h-0 flex flex-col border-t border-neutral-500/30 overflow-hidden">
+              <Transport playing={timeline.playing} playhead={timeline.playhead} duration={timeline.duration} dispatch={dispatch} />
+              <div className="flex-1 min-h-0 px-3 pb-2 min-w-0 overflow-hidden flex flex-col">
+                <TimelineTracks timeline={timeline} dispatch={dispatch} />
               </div>
-            )}
-          </div>
-
-          <div className="flex-[60] min-h-0 flex flex-col border-t border-neutral-500/30">
-            <Transport playing={timeline.playing} playhead={timeline.playhead} duration={timeline.duration} dispatch={dispatch} />
-            <div className="flex-1 min-h-0 px-3 pb-2 overflow-x-auto overflow-y-auto">
-              <Timeline timeline={timeline} dispatch={dispatch} />
-              <AudioTracks tracks={timeline.tracks} totalDuration={timeline.duration} dispatch={dispatch} />
             </div>
           </div>
         </div>
-      </div>
 
-      {/* ─── CoDirector Zone (~35%) ─── */}
-      <div className="flex-[35] min-h-0 flex flex-col p-3 gap-2 bg-neutral-800">
-        <div className="flex items-center gap-1.5 shrink-0">
-          <div className="w-4 h-4 rounded-full bg-white flex items-center justify-center text-[7px] font-bold text-neutral-900">Co</div>
-          <span className="text-[11px] font-medium text-neutral-300">CoDirector</span>
-          {apiKey && <span className="text-[8px] text-emerald-500 bg-emerald-900/30 px-1.5 py-px rounded-full ml-1">Tier 3</span>}
-        </div>
-
-        <CommandLog entries={commandLog} onClickEntry={handleLogEntryClick} />
-        <ProactiveSuggestion
-          timeline={timeline}
-          lastCommandTime={commandLog.length > 0 ? commandLog[commandLog.length - 1].timestamp : 0}
-          onAccept={handleCommand}
+        <ResizeHandle
+          direction="horizontal"
+          onResize={delta => {
+            const h = contentRef.current?.clientHeight ?? 500
+            setEditorRatio(r => Math.max(0.25, Math.min(0.85, r + delta / h)))
+          }}
         />
-        <InputArea onCommand={handleCommand} />
+
+        {/* CoDirector Zone */}
+        <div className="flex-1 min-h-0 flex flex-col p-3 gap-2 bg-neutral-800 overflow-hidden">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <div className="w-4 h-4 rounded-full bg-white flex items-center justify-center text-[7px] font-bold text-neutral-900">Co</div>
+            <span className="text-[11px] font-medium text-neutral-300">CoDirector</span>
+            {apiKey && <span className="text-[8px] text-emerald-500 bg-emerald-900/30 px-1.5 py-px rounded-full ml-1">Tier 3</span>}
+          </div>
+
+          <CommandLog entries={commandLog} onClickEntry={handleLogEntryClick} />
+          <ProactiveSuggestion
+            timeline={timeline}
+            lastCommandTime={commandLog.length > 0 ? commandLog[commandLog.length - 1].timestamp : 0}
+            onAccept={handleCommand}
+          />
+          <InputArea onCommand={handleCommand} />
+        </div>
       </div>
 
       {/* Overlays */}

@@ -17,6 +17,12 @@ function serializeTimeline(timeline: Timeline): string {
     effects: c.effects,
     captions: c.captions.length,
   }))
+  const textLayers = timeline.textLayers.map(tl => ({
+    id: tl.id,
+    text: tl.text,
+    start: tl.startTime.toFixed(1) + 's',
+    end: tl.endTime.toFixed(1) + 's',
+  }))
   const tracks = timeline.tracks.map(t => ({
     id: t.id,
     label: t.label,
@@ -26,6 +32,7 @@ function serializeTimeline(timeline: Timeline): string {
   }))
   return JSON.stringify({
     clips,
+    textLayers,
     tracks,
     totalDuration: timeline.duration.toFixed(1) + 's',
     selectedClipId: timeline.selectedClipId,
@@ -48,9 +55,16 @@ AVAILABLE OPERATIONS:
 - { type: "effect_remove", clipId: string, effectId: string }
 - { type: "caption_add", clipId: string, text: string }
 - { type: "transition_add", clipId: string, edge: "in"|"out", transitionType: "crossfade"|"cut"|"wipe"|"zoom" }
+- { type: "text_layer_add", text: string, startTime?: number, endTime?: number } // timeline text overlay
+- { type: "text_layer_edit", textLayerId: string, updates: { text?: string, startTime?: number, endTime?: number } }
+- { type: "text_layer_remove", textLayerId: string }
+- { type: "text_layer_move", textLayerId: string, startTime: number, endTime?: number }
 - { type: "track_volume", trackId: string, volume: number } // 0.0 to 1.0
 - { type: "track_mute", trackId: string, muted: boolean }
+- { type: "track_move", trackId: string, startTime: number }
 - { type: "select", clipId: string }
+- { type: "select_text_layer", textLayerId: string }
+- { type: "select_track", trackId: string }
 
 Respond with JSON only:
 {
@@ -87,7 +101,7 @@ export async function tier3Parse(
         'anthropic-dangerous-direct-browser-access': 'true',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6', // Valid models: claude-sonnet-4-6, claude-3-5-sonnet-20241022
         max_tokens: 1024,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: userPrompt }],
@@ -95,7 +109,9 @@ export async function tier3Parse(
     })
 
     if (!response.ok) {
-      throw new Error(`API error: ${response.status}`)
+      const errBody = await response.json().catch(() => ({}))
+      const msg = errBody?.error?.message ?? errBody?.message ?? `API error: ${response.status}`
+      throw new Error(msg)
     }
 
     const data = await response.json()
